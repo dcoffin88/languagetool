@@ -1,0 +1,163 @@
+name: Build & Publish
+
+"on":
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "LanguageTool version to build. Leave empty to use the latest upstream tag."
+        required: false
+        type: string
+      force:
+        description: "Build even if this repository already has a matching GitHub release."
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: "0 22 * * 6"
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  UPSTREAM_REPO: languagetool-org/languagetool
+  REGISTRY: ghcr.io
+
+jobs:
+  check-release:
+    name: Check Upstream Release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+      should_build: ${{ steps.release.outputs.should_build }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine LanguageTool release
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_VERSION: ${{ github.event.inputs.version || '' }}
+          FORCE_BUILD: ${{ github.event.inputs.force || 'false' }}
+        run: |
+          set -euo pipefail
+
+          latest_upstream_tag="$(
+            git ls-remote --tags --refs "https://github.com/${UPSTREAM_REPO}.git" "v*" \
+              | awk -F/ '{ print $NF }' \
+              | grep -E '^v[0-9]+(\.[0-9]+){1,2}$' \
+              | sort -V \
+              | tail -n 1
+          )"
+
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            tag="${GITHUB_REF_NAME}"
+            version="${tag#v}"
+          elif [[ -n "${INPUT_VERSION}" ]]; then
+            version="${INPUT_VERSION#v}"
+            tag="v${version}"
+          else
+            tag="${latest_upstream_tag}"
+            version="${tag#v}"
+          fi
+
+          if [[ -z "${version}" || -z "${tag}" ]]; then
+            echo "Unable to determine a LanguageTool release tag." >&2
+            exit 1
+          fi
+
+          if ! git ls-remote --exit-code --tags "https://github.com/${UPSTREAM_REPO}.git" "${tag}" >/dev/null; then
+            echo "Upstream tag ${tag} does not exist in ${UPSTREAM_REPO}." >&2
+            exit 1
+          fi
+
+          should_build="false"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" || "${FORCE_BUILD}" == "true" ]]; then
+            should_build="true"
+          elif ! gh release view "${tag}" >/dev/null 2>&1; then
+            should_build="true"
+          fi
+
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "should_build=${should_build}" >> "${GITHUB_OUTPUT}"
+
+          if [[ "${should_build}" == "true" ]]; then
+            echo "Will build LanguageTool ${version} from upstream ${tag}."
+          else
+            echo "Release ${tag} already exists. Nothing to build."
+          fi
+
+  build-and-publish:
+    name: Build & Publish Image
+    runs-on: ubuntu-latest
+    needs: check-release
+    if: needs.check-release.outputs.should_build == 'true'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare image name
+        id: image
+        run: |
+          set -euo pipefail
+          echo "name=$(echo "${REGISTRY}/${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')" >> "${GITHUB_OUTPUT}"
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            LANGUAGETOOL_VERSION=${{ needs.check-release.outputs.version }}
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ needs.check-release.outputs.version }}
+            ${{ steps.image.outputs.name }}:latest
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.check-release.outputs.tag }}
+          VERSION: ${{ needs.check-release.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          image="$(echo "${REGISTRY}/${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "GitHub release ${TAG} already exists."
+            exit 0
+          fi
+
+          if git ls-remote --exit-code --tags origin "${TAG}" >/dev/null 2>&1; then
+            gh release create "${TAG}" \
+              --verify-tag \
+              --title "${TAG}" \
+              --notes "Published ${image}:${VERSION} and ${image}:latest from upstream LanguageTool ${TAG}."
+          else
+            gh release create "${TAG}" \
+              --target "${GITHUB_SHA}" \
+              --title "${TAG}" \
+              --notes "Published ${image}:${VERSION} and ${image}:latest from upstream LanguageTool ${TAG}."
+          fi
