@@ -36,7 +36,6 @@ services:
       download_ngrams_langs: en,fr
       langtool_languageModel: /ngrams
       langtool_maxTextLength: 20000
-      langtool_pipelinePrewarming: true
       Java_Xms: 512m
       Java_Xmx: 1g
     network_mode: bridge
@@ -134,7 +133,13 @@ environment:
   langtool_pipelinePrewarming: true
 ```
 
-Prewarming can make startup slower and may use more memory during initialization, but it usually improves first-request latency after the container is ready.
+Prewarming can make startup slower and may use significantly more memory during initialization, especially when `langtool_languageModel` points to n-gram datasets. If you enable it with n-grams, increase `Java_Xmx`.
+
+```yaml
+environment:
+  langtool_pipelinePrewarming: true
+  Java_Xmx: 2g
+```
 
 Java heap settings are controlled separately:
 
